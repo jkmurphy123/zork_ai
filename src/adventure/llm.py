@@ -1,35 +1,60 @@
-import os
-import json
-from typing import List
+# src/adventure/llm.py
+import os, json
+from typing import List, Optional
 from openai import OpenAI
 from .schema import Room
 
 _SYSTEM = (
     "You are a game writer. Given a room id and minimal context, "
-    "return a strictly valid JSON object that includes a punchy name and a vivid 1-2 sentence description. "
-    "Do NOT modify exits or ids; you only write text."
+    "return JSON with fields 'id', 'name', and 'description' ONLY. "
+    "Keep name punchy; description 1–2 atmospheric sentences. "
+    "Do NOT invent new fields; do NOT change exits or ids."
 )
 
-# JSON Schema for Structured Outputs
-ROOM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "id": {"type": "string"},
-        "name": {"type": "string"},
-        "description": {"type": "string"}
-    },
-    "required": ["id", "name", "description"],
-    "additionalProperties": False
-}
+MODEL_DEFAULT = "gpt-4o-mini"
 
-MODEL = os.getenv("ADVENTURE_MODEL", "gpt-4o-2024-08-06")
+def _room_request_text(theme: str, r: Room) -> str:
+    return (
+        f"Theme: {theme}. Room id: {r.id}. "
+        f"Current placeholder name: {r.name}. Exit count: {len(r.exits)}. "
+        "Return a STRICT JSON object with keys exactly: "
+        "id (string), name (string), description (string). "
+        "No markdown, no code fences, no commentary—JSON only."
+    )
 
-def describe_rooms(rooms: List[Room], theme: str = "ruins", dry_run: bool = False) -> List[Room]:
-    """
-    Decorate rooms with creative names/descriptions.
-    Uses OpenAI Responses API Structured Outputs (json_schema, strict: true).
-    Set ADVENTURE_MODEL to override the default model.
-    """
+def _parse_json_object_from_responses(resp) -> Optional[dict]:
+    # Try various SDK shapes
+    # 1) Newer Responses “output_text”
+    text = getattr(resp, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+    # 2) Some SDKs: resp.output[0].content[0].text
+    try:
+        items = getattr(resp, "output", None)
+        if items:
+            item0 = items[0]
+            content = getattr(item0, "content", None)
+            if content:
+                chunk0 = content[0]
+                t = getattr(chunk0, "text", None)
+                if isinstance(t, str) and t.strip():
+                    return json.loads(t)
+    except Exception:
+        pass
+    # 3) Last resort (rare older shapes)
+    if hasattr(resp, "choices") and resp.choices:
+        txt = resp.choices[0].message.content
+        return json.loads(txt)
+    return None
+
+def _parse_json_object_from_chat(resp) -> dict:
+    txt = resp.choices[0].message.content
+    return json.loads(txt)
+
+def describe_rooms(rooms: List[Room], theme: str = "ruins", dry_run: bool = False, model: Optional[str] = None) -> List[Room]:
     if dry_run:
         for r in rooms:
             r.name = f"{theme.title()} — {r.id}"
@@ -37,56 +62,58 @@ def describe_rooms(rooms: List[Room], theme: str = "ruins", dry_run: bool = Fals
         return rooms
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = model or os.getenv("ADVENTURE_MODEL", MODEL_DEFAULT)
 
     for r in rooms:
-        user = (
-            f"Theme: {theme}. Room id: {r.id}. "
-            f"Placeholder name: {r.name}. "
-            f"Exit count: {len(r.exits)}. "
-            "Write a punchy 'name' and a short atmospheric 'description'."
-        )
+        user = _room_request_text(theme, r)
 
-        resp = client.responses.create(
-            model=MODEL,
-            input=[
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "room_description",
-                    "schema": ROOM_SCHEMA,
-                    "strict": True
-                }
-            },
-            temperature=0.9,
-        )
-
-        # Try to obtain parsed JSON; fall back to text
-        data = None
-
+        # Preferred path: Responses API with JSON mode
         try:
-            if getattr(resp, "output", None):
-                item = resp.output[0]
-                if getattr(item, "content", None):
-                    chunk = item.content[0]
-                    if getattr(chunk, "type", "") == "output_text" and getattr(chunk, "text", None):
-                        data = json.loads(chunk.text)
+            resp = client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,
+            )
+            data = _parse_json_object_from_responses(resp)
+            if not isinstance(data, dict):
+                raise ValueError("Could not parse JSON from Responses output.")
+        except TypeError as e:
+            # Fallback if this method signature doesn't accept response_format
+            # or the SDK doesn't support Responses API params yet.
+            if "response_format" not in str(e):
+                # If it's some other TypeError, propagate it
+                raise
+            chat = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,
+            )
+            data = _parse_json_object_from_chat(chat)
         except Exception:
-            data = None
+            # If any other Responses error happens, try Chat JSON mode anyway
+            chat = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,
+            )
+            data = _parse_json_object_from_chat(chat)
 
-        if data is None:
-            text = getattr(resp, "output_text", None)
-            if not text and hasattr(resp, "choices"):
-                text = resp.choices[0].message.content  # older SDK compat
-            if not text and hasattr(resp, "content"):
-                text = resp.content
-            if not text:
-                raise RuntimeError(f"Unrecognized Responses payload shape: {resp}")
-            data = json.loads(text)
-
-        r.name = data.get("name", r.name)
-        r.description = data.get("description", r.description)
+        # Defensive normalization
+        if not isinstance(data, dict):
+            data = {}
+        r.name = str(data.get("name", r.name))
+        r.description = str(data.get("description", r.description))
 
     return rooms
