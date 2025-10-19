@@ -1,4 +1,3 @@
-
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
@@ -15,6 +14,9 @@ class Room(BaseModel):
     name: str
     description: str
     exits: List[Exit] = Field(default_factory=list)
+    # NEW (optional) fields for themed roles
+    type: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
 
 class Adventure(BaseModel):
     schema_version: int = 1
@@ -22,6 +24,9 @@ class Adventure(BaseModel):
     seed: int
     rooms: List[Room]
     start_room: str
+    # NEW global flavor
+    lore: Optional[str] = None
+    style_guide: List[str] = Field(default_factory=list)
 
     @field_validator("rooms")
     @classmethod

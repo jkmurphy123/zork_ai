@@ -1,37 +1,34 @@
-# src/adventure/llm.py
 import os, json
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from openai import OpenAI
 from .schema import Room
 
-_SYSTEM = (
-    "You are a game writer. Given a room id and minimal context, "
-    "return JSON with fields 'id', 'name', and 'description' ONLY. "
-    "Keep name punchy; description 1–2 atmospheric sentences. "
-    "Do NOT invent new fields; do NOT change exits or ids."
-)
-
 MODEL_DEFAULT = "gpt-4o-mini"
 
-def _room_request_text(theme: str, r: Room) -> str:
+_SYSTEM_DESC = (
+    "You are a game writer. Given context, return JSON with exactly keys "
+    "id, name, description. Name 2–5 evocative words; description 1–2 vivid, sensory sentences. "
+    "Do not invent extra keys, markdown, or commentary."
+)
+
+def _room_request_text(theme: str, r: Room, lore: Optional[str], style: Optional[List[str]], neighbor_types: List[str]) -> str:
     return (
-        f"Theme: {theme}. Room id: {r.id}. "
-        f"Current placeholder name: {r.name}. Exit count: {len(r.exits)}. "
-        "Return a STRICT JSON object with keys exactly: "
-        "id (string), name (string), description (string). "
-        "No markdown, no code fences, no commentary—JSON only."
+        f"Theme: {theme}\n"
+        f"Lore: {lore or ''}\n"
+        f"Style guide rules: {style or []}\n"
+        f"""Room blueprint:
+- id: {r.id}
+- location_type: {r.type}
+- tags: {', '.join(r.tags) if r.tags else ''}
+- neighbor_location_types: {', '.join(neighbor_types) if neighbor_types else ''}
+"""
+Return STRICT JSON with keys: id (string), name (string), description (string). No markdown."
     )
 
-def _parse_json_object_from_responses(resp) -> Optional[dict]:
-    # Try various SDK shapes
-    # 1) Newer Responses “output_text”
+def _parse_json_from_responses(resp):
     text = getattr(resp, "output_text", None)
     if isinstance(text, str) and text.strip():
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
-    # 2) Some SDKs: resp.output[0].content[0].text
+        return json.loads(text)
     try:
         items = getattr(resp, "output", None)
         if items:
@@ -44,17 +41,64 @@ def _parse_json_object_from_responses(resp) -> Optional[dict]:
                     return json.loads(t)
     except Exception:
         pass
-    # 3) Last resort (rare older shapes)
     if hasattr(resp, "choices") and resp.choices:
-        txt = resp.choices[0].message.content
-        return json.loads(txt)
+        return json.loads(resp.choices[0].message.content)
     return None
 
-def _parse_json_object_from_chat(resp) -> dict:
-    txt = resp.choices[0].message.content
-    return json.loads(txt)
+def _parse_json_from_chat(resp):
+    return json.loads(resp.choices[0].message.content)
 
-def describe_rooms(rooms: List[Room], theme: str = "ruins", dry_run: bool = False, model: Optional[str] = None) -> List[Room]:
+def generate_location_catalog(theme: str, n_rooms: int, model: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Return a dict with: lore (str), style_guide (list[str]), locations (list[loc]).
+    Each location: {slug, name, tags:[...], min:int, max:int}
+    Uses JSON mode for broad SDK compatibility.
+    """
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = model or os.getenv("ADVENTURE_MODEL", MODEL_DEFAULT)
+
+    system = (
+        "You are designing a coherent location catalog for a text adventure. "
+        "Return JSON ONLY with keys: lore (string), style_guide (array of short rules), locations (array). "
+        "Each location has: slug, name, tags (3-6), min, max."
+    )
+    user = f"""
+Theme: {theme}
+We will generate exactly {n_rooms} rooms.
+Propose 28–36 candidate locations with min/max counts that could plausibly compose the space.
+Rules:
+- Include hubs (1–2), chokepoints (1–3), corridors/airlocks, labs/workspaces, utilities, living areas, exterior.
+- Keep slugs lowercase_with_underscores.
+- min and max are integers; max >= min; typical min 0–2, max 2–6.
+Output JSON ONLY.
+"""
+
+    # Prefer Chat Completions with JSON mode for compatibility
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role":"system","content":system},
+            {"role":"user","content":user}
+        ],
+        response_format={"type":"json_object"},
+        temperature=0.5,
+    )
+    data = _parse_json_from_chat(resp)
+    data = data if isinstance(data, dict) else {}
+    data.setdefault("lore", "")
+    data.setdefault("style_guide", [])
+    data.setdefault("locations", [])
+    return data
+
+def describe_rooms(
+    rooms: List[Room],
+    theme: str = "ruins",
+    dry_run: bool = False,
+    model: Optional[str] = None,
+    lore: Optional[str] = None,
+    style_guide: Optional[List[str]] = None,
+    neighbors_fn=None
+) -> List[Room]:
     if dry_run:
         for r in rooms:
             r.name = f"{theme.title()} — {r.id}"
@@ -65,55 +109,34 @@ def describe_rooms(rooms: List[Room], theme: str = "ruins", dry_run: bool = Fals
     model = model or os.getenv("ADVENTURE_MODEL", MODEL_DEFAULT)
 
     for r in rooms:
-        user = _room_request_text(theme, r)
+        neighbor_types = neighbors_fn(r) if callable(neighbors_fn) else []
+        user = _room_request_text(theme, r, lore, style_guide, neighbor_types)
 
-        # Preferred path: Responses API with JSON mode
         try:
             resp = client.responses.create(
                 model=model,
                 input=[
-                    {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": user},
+                    {"role":"system","content":_SYSTEM_DESC},
+                    {"role":"user","content":user},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0.9,
+                response_format={"type":"json_object"},
+                temperature=0.8,
             )
-            data = _parse_json_object_from_responses(resp)
+            data = _parse_json_from_responses(resp)
             if not isinstance(data, dict):
                 raise ValueError("Could not parse JSON from Responses output.")
-        except TypeError as e:
-            # Fallback if this method signature doesn't accept response_format
-            # or the SDK doesn't support Responses API params yet.
-            if "response_format" not in str(e):
-                # If it's some other TypeError, propagate it
-                raise
-            chat = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": user},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.9,
-            )
-            data = _parse_json_object_from_chat(chat)
         except Exception:
-            # If any other Responses error happens, try Chat JSON mode anyway
             chat = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": user},
+                    {"role":"system","content":_SYSTEM_DESC},
+                    {"role":"user","content":user},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0.9,
+                response_format={"type":"json_object"},
+                temperature=0.8,
             )
-            data = _parse_json_object_from_chat(chat)
+            data = _parse_json_from_chat(chat)
 
-        # Defensive normalization
-        if not isinstance(data, dict):
-            data = {}
         r.name = str(data.get("name", r.name))
         r.description = str(data.get("description", r.description))
-
     return rooms
