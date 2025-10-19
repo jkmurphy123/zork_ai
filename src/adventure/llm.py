@@ -22,7 +22,7 @@ ROOM_SCHEMA = {
     "additionalProperties": False
 }
 
-MODEL = os.getenv("ADVENTURE_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("ADVENTURE_MODEL", "gpt-4o-2024-08-06")
 
 def describe_rooms(rooms: List[Room], theme: str = "ruins", dry_run: bool = False) -> List[Room]:
     """
