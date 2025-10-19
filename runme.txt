@@ -1,0 +1,24 @@
+Windows
+
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -e .
+setx OPENAI_API_KEY "sk-..."
+
+Linux
+
+python -m venv .venv
+source ./.venv/bin/activate 
+pip install -e .
+export OPENAI_API_KEY=sk-...
+
+Run activate
+
+# 5) Generate an adventure (LLM descriptions)
+python -m adventure.cli generate --title "The Brass Catacombs" --rooms 24 --theme ruins
+
+# 6) Play it
+python -m adventure.cli play out/adventure.json
+
+# Want to test without calling the API?
+python -m adventure.cli generate --dry
